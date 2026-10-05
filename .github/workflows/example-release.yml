@@ -160,7 +160,12 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: dmg
+    # `select` must be listed here as well as `dmg`: the `needs` context only
+    # carries the jobs this job names, so without it needs.select.outputs.tag
+    # resolves to an empty string and gh release create fails for a missing tag.
+    needs:
+      - select
+      - dmg
     # Publish whatever built: one failed matrix cell must not discard the
     # archives that succeeded, and an empty result fails loudly below
     # rather than creating a release with no assets.
@@ -184,6 +189,10 @@ jobs:
           SIGNING: ${{ needs.select.outputs.signing }}
         run: |
           set -euo pipefail
+          if [ -z "${TAG:-}" ]; then
+            echo "no release tag resolved (tag push names the release; dispatch passes inputs.tag)" >&2
+            exit 1
+          fi
           if [ -z "$(ls -A dist 2>/dev/null)" ]; then
             echo "no .dmg artifacts were produced; nothing to release" >&2
             exit 1
