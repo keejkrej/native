@@ -1,0 +1,215 @@
+name: Example DMG Release
+
+# Packages the examples listed under "Start here: TypeScript + Native
+# markup" (examples/README.md) as macOS .dmg archives and attaches them to
+# one GitHub Release. Two deliberate entry points, both publishing
+# artifacts on purpose:
+#
+#   - workflow_dispatch: pick "all" for the whole table in one run, or a
+#     single example for a quick build. Only dispatchable once this file is
+#     on the default branch.
+#   - push of an `examples-*` tag: publishes that tag from any branch, so a
+#     release can be cut without landing this file on the default branch.
+#     The tag names the release, and the run uses the "all" example set.
+#
+# The lane mirrors what CI already does for these examples (Zig 0.16.0,
+# Node 24, the exact-pinned core compiler from packages/core) and runs on
+# macos-15 because ScriptC's native codegen helper requires macOS 15 or
+# newer — the same reason ci.yml's macOS lanes are macos-15.
+on:
+  workflow_dispatch:
+    inputs:
+      example:
+        description: Example to package ("all" builds every row of the Start-here table)
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - chatbot
+          - gpu-components
+          - relational-notes
+          - service-feed-reader
+          - soundboard-ts
+          - system-monitor-ts
+      tag:
+        description: Release tag to create or update
+        type: string
+        required: true
+        default: examples-typescript-v1
+      signing:
+        description: macOS signing mode
+        type: choice
+        required: true
+        default: adhoc
+        options:
+          - adhoc
+          - none
+  push:
+    tags:
+      - "examples-*"
+
+run-name: Example DMG Release (${{ github.ref_name }})
+
+permissions:
+  contents: read
+
+concurrency:
+  group: example-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  select:
+    name: Select examples
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+      tag: ${{ steps.select.outputs.tag }}
+      signing: ${{ steps.select.outputs.signing }}
+    steps:
+      - name: Resolve the example list
+        id: select
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          IN_EXAMPLE: ${{ inputs.example }}
+          IN_TAG: ${{ inputs.tag }}
+          IN_SIGNING: ${{ inputs.signing }}
+        run: |
+          set -euo pipefail
+          example="${IN_EXAMPLE:-all}"
+          signing="${IN_SIGNING:-adhoc}"
+          if [ "$EVENT" = "tag" ] || [ "$EVENT" = "push" ]; then
+            tag="$REF_NAME"
+          else
+            tag="${IN_TAG:-examples-typescript-v1}"
+          fi
+          all='["chatbot","gpu-components","relational-notes","service-feed-reader","soundboard-ts","system-monitor-ts"]'
+          if [ "$example" = "all" ]; then
+            matrix="$all"
+          else
+            case "$all" in
+              *"\"$example\""*) matrix='["'"$example"'"]' ;;
+              *) echo "unknown example: $example" >&2; exit 2 ;;
+            esac
+          fi
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "signing=$signing" >> "$GITHUB_OUTPUT"
+          echo "packaging $matrix -> $tag (signing: $signing)"
+
+  dmg:
+    name: Package ${{ matrix.example }}
+    needs: select
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        example: ${{ fromJSON(needs.select.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: vercel-labs/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # src/core.ts compiles to native code at build time: the
+      # @native-sdk/core frontend and the exact-pinned external core
+      # compiler both arrive with this one install (packages/core is the
+      # one place the compiler pin lives).
+      - name: Install the core compiler dependency
+        run: npm ci --prefix packages/core
+
+      # `zig build cli` installs just zig-out/bin/native — the same lean
+      # step the release pipeline cross-compiles for every platform.
+      - name: Build the Native SDK CLI
+        run: zig build cli
+
+      # The CLI resolves the framework from NATIVE_SDK_PATH when it is set
+      # and from its own location otherwise; this checkout is the framework.
+      - name: Build the example
+        working-directory: examples/${{ matrix.example }}
+        env:
+          NATIVE_SDK_PATH: ${{ github.workspace }}
+        run: ${{ github.workspace }}/zig-out/bin/native build
+
+      - name: Package a macOS DMG
+        working-directory: examples/${{ matrix.example }}
+        env:
+          NATIVE_SDK_PATH: ${{ github.workspace }}
+          SIGNING: ${{ needs.select.outputs.signing }}
+        run: |
+          set -euo pipefail
+          "$GITHUB_WORKSPACE/zig-out/bin/native" package \
+            --target macos \
+            --archive \
+            --signing "$SIGNING"
+          ls -l zig-out/package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dmg-${{ matrix.example }}
+          path: examples/${{ matrix.example }}/zig-out/package/*.dmg
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: dmg
+    # Publish whatever built: one failed matrix cell must not discard the
+    # archives that succeeded, and an empty result fails loudly below
+    # rather than creating a release with no assets.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.select.outputs.tag }}
+          EXAMPLE: ${{ inputs.example || 'all' }}
+          SIGNING: ${{ needs.select.outputs.signing }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(ls -A dist 2>/dev/null)" ]; then
+            echo "no .dmg artifacts were produced; nothing to release" >&2
+            exit 1
+          fi
+
+          shasum -a 256 dist/*.dmg > dist/CHECKSUMS.txt
+          cat dist/CHECKSUMS.txt
+
+          NOTES="$(cat <<NOTES
+          ## Native SDK example builds (${EXAMPLE})
+
+          macOS DMG archives of the examples listed under
+          'Start here: TypeScript + Native markup' in examples/README.md.
+          Each app is TypeScript plus Native markup compiled ahead of time
+          to native code, so no JS runtime ships in the binary.
+
+          Signing mode: ${SIGNING}. These builds are not notarized, so the
+          first launch needs Finder -> Open (or clear the quarantine
+          attribute first: xattr -dr com.apple.quarantine <App>.app).
+          NOTES
+          )"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG exists; uploading assets"
+          else
+            gh release create "$TAG" --title "$TAG" --notes "$NOTES"
+          fi
+
+          gh release upload "$TAG" dist/*.dmg dist/CHECKSUMS.txt --clobber
